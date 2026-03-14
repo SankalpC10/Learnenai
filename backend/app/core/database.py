@@ -1,35 +1,13 @@
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.orm import DeclarativeBase
+from supabase import create_client, Client
 from app.core.config import get_settings
 
-settings = get_settings()
-
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=settings.DEBUG,
-)
-
-async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+_client: Client | None = None
 
 
-class Base(DeclarativeBase):
-    pass
-
-
-async def get_db() -> AsyncSession:
-    """Dependency: yields an async database session."""
-    async with async_session() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
-
-
-async def init_db():
-    """Create all tables (dev convenience — use Alembic in production)."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+def get_supabase() -> Client:
+    """Get Supabase client with service role key (bypasses RLS)."""
+    global _client
+    if _client is None:
+        settings = get_settings()
+        _client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+    return _client

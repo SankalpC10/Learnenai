@@ -1,109 +1,70 @@
 """
 Keyword Suggestion API Endpoints
 """
-import json
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from pydantic import BaseModel
-
-from app.core.database import get_db
-from app.models.domain import Domain, Keyword, CrawlStatus
-from app.services.keyword_service import suggest_keywords
+from fastapi import APIRouter, Depends
+from app.core.auth import get_current_user, AuthenticatedUser
+from app.core.database import get_supabase
+from app.core.exceptions import NotFoundError, ValidationError
+from app.core.dependencies import get_keyword_service
+from app.core.logging import get_logger
+from app.api.schemas.keywords import KeywordSuggestRequest, KeywordResponse
+from app.services.keyword_service import KeywordService
+from app.services.domain_helpers import build_brand_profile
 
 router = APIRouter()
+logger = get_logger("api.keywords")
 
-
-# --- Schemas ---
-
-class KeywordSuggestRequest(BaseModel):
-    domain_id: int
-    count: int = 15
-
-class KeywordResponse(BaseModel):
-    id: int
-    domain_id: int
-    keyword: str
-    search_volume: int | None = None
-    difficulty: str | None = None
-    suggested_title: str | None = None
-    used: bool = False
-
-    class Config:
-        from_attributes = True
-
-
-# --- Endpoints ---
 
 @router.post("/suggest", response_model=list[KeywordResponse])
 async def suggest(
     data: KeywordSuggestRequest,
-    db: AsyncSession = Depends(get_db),
+    user: AuthenticatedUser = Depends(get_current_user),
+    keyword_svc: KeywordService = Depends(get_keyword_service),
 ):
-    """Generate keyword suggestions for a domain."""
-    domain = await db.get(Domain, data.domain_id)
-    if not domain:
-        raise HTTPException(status_code=404, detail="Domain not found")
-    
-    if domain.crawl_status != CrawlStatus.COMPLETED:
-        raise HTTPException(status_code=400, detail=f"Domain crawl not completed. Status: {domain.crawl_status.value}")
-    
-    # Build brand profile dict from domain
-    topics = []
-    if domain.key_topics:
-        try:
-            topics = json.loads(domain.key_topics)
-        except (json.JSONDecodeError, TypeError):
-            topics = []
-    
-    brand_profile = {
-        "company_name": domain.company_name,
-        "industry": domain.industry,
-        "target_audience": domain.target_audience,
-        "brand_voice": domain.brand_voice,
-        "key_topics": topics,
-        "brand_summary": domain.brand_summary,
-    }
-    
-    suggestions = await suggest_keywords(brand_profile, count=data.count)
-    
-    # Save to database
-    saved_keywords = []
+    sb = get_supabase()
+    domain_result = sb.table("domains").select("*").eq("id", data.domain_id).eq("user_id", user.id).execute()
+    if not domain_result.data:
+        raise NotFoundError("Domain", data.domain_id)
+
+    domain = domain_result.data[0]
+    if domain["crawl_status"] != "completed":
+        raise ValidationError(f"Domain crawl not completed. Status: {domain['crawl_status']}")
+
+    brand_profile = build_brand_profile(domain)
+    suggestions = await keyword_svc.suggest_keywords(brand_profile, count=data.count)
+
+    saved = []
     for kw in suggestions:
-        # Map volume estimate to rough number
         volume = kw.get("search_volume")
         if not isinstance(volume, int):
             volume_map = {"Low": 200, "Medium": 1000, "High": 5000}
             volume = volume_map.get(kw.get("search_volume_estimate", "Low"), 200)
-        
-        keyword_record = Keyword(
-            domain_id=data.domain_id,
-            keyword=kw["keyword"],
-            search_volume=volume,
-            difficulty=kw.get("difficulty_estimate", "Medium"),
-            suggested_title=kw.get("suggested_title"),
-        )
-        db.add(keyword_record)
-        saved_keywords.append(keyword_record)
-    
-    await db.commit()
-    
-    # Refresh to get IDs
-    for kw in saved_keywords:
-        await db.refresh(kw)
-    
-    return saved_keywords
+
+        record = sb.table("keywords").insert({
+            "domain_id": data.domain_id,
+            "user_id": user.id,
+            "keyword": kw["keyword"],
+            "search_volume": volume,
+            "difficulty": kw.get("difficulty_estimate", "Medium"),
+            "suggested_title": kw.get("suggested_title"),
+        }).execute()
+        saved.append(record.data[0])
+
+    return saved
 
 
 @router.get("", response_model=list[KeywordResponse])
 async def list_keywords(
-    domain_id: int,
-    db: AsyncSession = Depends(get_db),
+    domain_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
 ):
-    """List all keywords for a domain."""
-    result = await db.execute(
-        select(Keyword)
-        .where(Keyword.domain_id == domain_id)
-        .order_by(Keyword.search_volume.desc())
+    sb = get_supabase()
+    result = (
+        sb.table("keywords")
+        .select("*")
+        .eq("domain_id", domain_id)
+        .eq("user_id", user.id)
+        .order("search_volume", desc=True)
+        .execute()
     )
-    return result.scalars().all()
+    return result.data
